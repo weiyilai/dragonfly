@@ -116,7 +116,7 @@ OpResult<ShardFFResult> FindFirstNonEmpty(Transaction* trans, int req_obj_type) 
     return OpStatus::WRONG_TYPE;
 
   // Order result by their keys position in the command arguments, push errors to back
-  auto comp = [trans](const OpResult<FFResult>& lhs, const OpResult<FFResult>& rhs) {
+  auto comp = [](const OpResult<FFResult>& lhs, const OpResult<FFResult>& rhs) {
     if (!lhs || !rhs)
       return lhs.ok();
     size_t i1 = std::get<1>(*lhs);
@@ -339,9 +339,10 @@ OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_ty
   }
 
   auto wcb = [](Transaction* t, EngineShard* shard) { return t->GetShardArgs(shard->shard_id()); };
-  const auto key_checker = [req_obj_type](EngineShard* owner, const DbContext& context,
-                                          Transaction*, std::string_view key) -> bool {
-    return context.GetDbSlice(owner->shard_id()).FindReadOnly(context, key, req_obj_type).ok();
+  auto* ns = &trans->GetNamespace();
+  const auto key_checker = [req_obj_type, ns](EngineShard* owner, const DbContext& context,
+                                              Transaction*, std::string_view key) -> bool {
+    return ns->GetDbSlice(owner->shard_id()).FindReadOnly(context, key, req_obj_type).ok();
   };
 
   auto status = trans->WaitOnWatch(limit_tp, std::move(wcb), key_checker, block_flag, pause_flag);

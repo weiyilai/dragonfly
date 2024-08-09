@@ -165,7 +165,7 @@ void MemoryCmd::Run(CmdArgList args) {
   }
 
   if (sub_cmd == "DEFRAGMENT") {
-    shard_set->pool()->DispatchOnAll([this](util::ProactorBase*) {
+    shard_set->pool()->DispatchOnAll([](util::ProactorBase*) {
       if (auto* shard = EngineShard::tlocal(); shard)
         shard->ForceDefrag();
     });
@@ -245,26 +245,15 @@ void PushMemoryUsageStats(const base::IoBuf::MemoryUsage& mem, string_view prefi
 void MemoryCmd::Stats() {
   vector<pair<string, size_t>> stats;
   stats.reserve(25);
-  auto server_metrics = owner_->GetMetrics();
-
-  // RSS
-  stats.push_back({"rss_bytes", rss_mem_current.load(memory_order_relaxed)});
-  stats.push_back({"rss_peak_bytes", rss_mem_peak.load(memory_order_relaxed)});
-
-  // Used by DbShards and DashTable
-  stats.push_back({"data_bytes", used_mem_current.load(memory_order_relaxed)});
-  stats.push_back({"data_peak_bytes", used_mem_peak.load(memory_order_relaxed)});
-
   ConnectionMemoryUsage connection_memory = GetConnectionMemoryUsage(owner_);
 
   // Connection stats, excluding replication connections
   stats.push_back({"connections.count", connection_memory.connection_count});
   stats.push_back({"connections.direct_bytes", connection_memory.connection_size});
-  PushMemoryUsageStats(connection_memory.connections_memory, "connections",
-                       connection_memory.connections_memory.GetTotalSize() +
-                           connection_memory.pipelined_bytes + connection_memory.connection_size,
-                       &stats);
-  stats.push_back({"connections.pipeline_bytes", connection_memory.pipelined_bytes});
+  PushMemoryUsageStats(
+      connection_memory.connections_memory, "connections",
+      connection_memory.connections_memory.GetTotalSize() + connection_memory.connection_size,
+      &stats);
 
   // Replication connection stats
   stats.push_back(
@@ -274,17 +263,6 @@ void MemoryCmd::Stats() {
                        connection_memory.replication_memory.GetTotalSize() +
                            connection_memory.replication_connection_size,
                        &stats);
-
-  atomic<size_t> serialization_memory = 0;
-  atomic<size_t> tls_memory = 0;
-  shard_set->pool()->AwaitFiberOnAll([&](auto*) {
-    serialization_memory.fetch_add(SliceSnapshot::GetThreadLocalMemoryUsage());
-    tls_memory.fetch_add(Listener::TLSUsedMemoryThreadLocal());
-  });
-
-  // Serialization stats, including both replication-related serialization and saving to RDB files.
-  stats.push_back({"serialization", serialization_memory.load()});
-  stats.push_back({"tls", tls_memory.load()});
 
   auto* rb = static_cast<RedisReplyBuilder*>(cntx_->reply_builder());
   rb->StartCollection(stats.size(), RedisReplyBuilder::MAP);
@@ -369,8 +347,8 @@ void MemoryCmd::ArenaStats(CmdArgList args) {
 
 void MemoryCmd::Usage(std::string_view key) {
   ShardId sid = Shard(key, shard_set->size());
-  ssize_t memory_usage = shard_set->pool()->at(sid)->AwaitBrief([key, this]() -> ssize_t {
-    auto& db_slice = EngineShard::tlocal()->db_slice();
+  ssize_t memory_usage = shard_set->pool()->at(sid)->AwaitBrief([key, this, sid]() -> ssize_t {
+    auto& db_slice = cntx_->ns->GetDbSlice(sid);
     auto [pt, exp_t] = db_slice.GetTables(cntx_->db_index());
     PrimeIterator it = pt->Find(key);
     if (IsValid(it)) {

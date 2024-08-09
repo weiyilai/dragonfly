@@ -58,8 +58,11 @@ class User final {
     std::vector<UpdateKey> keys;
     bool reset_all_keys{false};
     bool allow_all_keys{false};
+
     // TODO allow reset all
     // bool reset_all{false};
+
+    std::string ns;
   };
 
   using CategoryChange = uint32_t;
@@ -81,7 +84,9 @@ class User final {
   User(User&&) = default;
 
   // For single step updates
-  void Update(UpdateRequest&& req);
+  void Update(UpdateRequest&& req, const CategoryToIdxStore& cat_to_id,
+              const ReverseCategoryIndexTable& reverse_cat,
+              const CategoryToCommandsIndexStore& cat_to_commands);
 
   bool HasPassword(std::string_view password) const;
 
@@ -102,6 +107,8 @@ class User final {
 
   const AclKeys& Keys() const;
 
+  const std::string& Namespace() const;
+
   using CategoryChanges = absl::flat_hash_map<CategoryChange, ChangeMetadata>;
   using CommandChanges = absl::flat_hash_map<CommandChange, ChangeMetadata>;
 
@@ -110,8 +117,12 @@ class User final {
   const CommandChanges& CmdChanges() const;
 
  private:
-  void SetAclCategoriesAndIncrSeq(uint32_t cat);
-  void UnsetAclCategoriesAndIncrSeq(uint32_t cat);
+  void SetAclCategoriesAndIncrSeq(uint32_t cat, const CategoryToIdxStore& cat_to_id,
+                                  const ReverseCategoryIndexTable& reverse_cat,
+                                  const CategoryToCommandsIndexStore& cat_to_commands);
+  void UnsetAclCategoriesAndIncrSeq(uint32_t cat, const CategoryToIdxStore& cat_to_id,
+                                    const ReverseCategoryIndexTable& reverse_cat,
+                                    const CategoryToCommandsIndexStore& cat_to_commands);
 
   // For ACL commands
   void SetAclCommands(size_t index, uint64_t bit_index);
@@ -129,6 +140,7 @@ class User final {
 
   // For ACL key globs
   void SetKeyGlobs(std::vector<UpdateKey> keys);
+  void SetNamespace(const std::string& ns);
 
   // Set NOPASS and remove all passwords
   void SetNopass();
@@ -160,6 +172,8 @@ class User final {
 
   // if the user is on/off
   bool is_active_{false};
+
+  std::string namespace_;
 };
 
 }  // namespace dfly::acl

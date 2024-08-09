@@ -3,6 +3,7 @@
 //
 #include "server/list_family.h"
 
+#include "facade/cmd_arg_parser.h"
 #include "server/acl/acl_commands_def.h"
 
 extern "C" {
@@ -98,15 +99,9 @@ string ListPop(ListDir dir, quicklist* ql) {
   return res;
 }
 
-optional<ListDir> ParseDir(string_view arg) {
-  if (arg == "LEFT") {
-    return ListDir::LEFT;
-  }
-  if (arg == "RIGHT") {
-    return ListDir::RIGHT;
-  }
-
-  return nullopt;
+ListDir ParseDir(facade::CmdArgParser* parser) {
+  parser->ToUpper();
+  return parser->Switch("LEFT", ListDir::LEFT, "RIGHT", ListDir::RIGHT);
 }
 
 string_view DirToSv(ListDir dir) {
@@ -128,35 +123,6 @@ bool ElemCompare(const quicklistEntry& entry, string_view elem) {
   absl::AlphaNum an(entry.longval);
   return elem == an.Piece();
 }
-
-// Circular buffer for string messages
-struct CircularMessages {
-  CircularMessages(size_t size) : current{0}, messages{size} {
-  }
-
-  string* Next() {
-    string* next = &messages[current];
-    current = (current + 1) % messages.size();
-    next->clear();
-    return next;
-  }
-
-  vector<string> All() {
-    vector<string> out;
-    out.insert(out.end(), messages.begin() + current, messages.end());
-    out.insert(out.end(), messages.begin(), messages.begin() + current);
-    out.erase(std::remove_if(out.begin(), out.end(), [&](const auto& msg) { return msg.empty(); }),
-              out.end());
-    return out;
-  }
-
-  int current = 0;
-  vector<string> messages;
-};
-
-// Temporary debug measures. Trace what happens with list keys on given shard.
-// Used to recover logs for BLPOP failures. See OpBPop.
-thread_local CircularMessages debugMessages{50};
 
 class BPopPusher {
  public:
@@ -181,27 +147,10 @@ std::string OpBPop(Transaction* t, EngineShard* shard, std::string_view key, Lis
   auto& db_slice = t->GetDbSlice(shard->shard_id());
   auto it_res = db_slice.FindMutable(t->GetDbContext(), key, OBJ_LIST);
 
-  if (!it_res) {
-    auto messages = debugMessages.All();
-    stringstream out;
-    out << "CRASH REPORT" << endl;
-    out << "key: " << key << " tx: " << t->DebugId() << "\n";
-    out << "===\n";
-    for (auto msg : messages)
-      out << msg << "\n";
-    out << "===" << endl;
-    LOG(ERROR) << out.str();
-    LOG(FATAL)
-        << "Encountered critical error. Please open a github issue or message us on discord with "
-           "attached report. https://github.com/dragonflydb/dragonfly";
-  }
-
   CHECK(it_res) << t->DebugId() << " " << key;  // must exist and must be ok.
 
   auto it = it_res->it;
   quicklist* ql = GetQL(it->second);
-
-  absl::StrAppend(debugMessages.Next(), "OpBPop: ", key, " by ", t->DebugId());
 
   std::string value = ListPop(dir, ql);
   it_res->post_updater.Run();
@@ -209,8 +158,6 @@ std::string OpBPop(Transaction* t, EngineShard* shard, std::string_view key, Lis
   OpArgs op_args = t->GetOpArgs(shard);
   if (quicklistCount(ql) == 0) {
     DVLOG(1) << "deleting key " << key << " " << t->DebugId();
-    absl::StrAppend(debugMessages.Next(), "OpBPop Del: ", key, " by ", t->DebugId());
-
     CHECK(op_args.GetDbSlice().Del(op_args.db_cntx, it));
   }
 
@@ -341,13 +288,12 @@ OpResult<uint32_t> OpPush(const OpArgs& op_args, std::string_view key, ListDir d
   }
 
   if (res.is_new) {
-    if (es->blocking_controller()) {
+    auto blocking_controller = op_args.db_cntx.ns->GetBlockingController(es->shard_id());
+    if (blocking_controller) {
       string tmp;
       string_view key = res.it->first.GetSlice(&tmp);
 
-      es->blocking_controller()->AwakeWatched(op_args.db_cntx.db_index, key);
-      absl::StrAppend(debugMessages.Next(), "OpPush AwakeWatched: ", key, " by ",
-                      op_args.tx->DebugId());
+      blocking_controller->AwakeWatched(op_args.db_cntx.db_index, key);
     }
   }
 
@@ -391,7 +337,6 @@ OpResult<StringVec> OpPop(const OpArgs& op_args, string_view key, ListDir dir, u
   it_res->post_updater.Run();
 
   if (quicklistCount(ql) == 0) {
-    absl::StrAppend(debugMessages.Next(), "OpPop Del: ", key, " by ", op_args.tx->DebugId());
     CHECK(db_slice.Del(op_args.db_cntx, it));
   }
 
@@ -444,11 +389,12 @@ OpResult<string> MoveTwoShards(Transaction* trans, string_view src, string_view 
         OpPush(op_args, key, dest_dir, false, ArgSlice{val}, true);
 
         // blocking_controller does not have to be set with non-blocking transactions.
-        if (shard->blocking_controller()) {
+        auto blocking_controller = t->GetNamespace().GetBlockingController(shard->shard_id());
+        if (blocking_controller) {
           // hack, again. since we hacked which queue we are waiting on (see RunPair)
           // we must clean-up src key here manually. See RunPair why we do this.
           // in short- we suspended on "src" on both shards.
-          shard->blocking_controller()->FinalizeWatched(ArgSlice({src}), t);
+          blocking_controller->FinalizeWatched(ArgSlice({src}), t);
         }
       } else {
         DVLOG(1) << "Popping value from list: " << key;
@@ -749,18 +695,15 @@ void RPopLPush(CmdArgList args, ConnectionContext* cntx) {
 }
 
 void BRPopLPush(CmdArgList args, ConnectionContext* cntx) {
-  string_view src = ArgS(args, 0);
-  string_view dest = ArgS(args, 1);
-  string_view timeout_str = ArgS(args, 2);
+  facade::CmdArgParser parser{args};
+  auto [src, dest] = parser.Next<string_view, string_view>();
+  float timeout = parser.Next<float>();
 
-  float timeout;
-  if (!absl::SimpleAtof(timeout_str, &timeout)) {
-    return cntx->SendError("timeout is not a float or out of range");
-  }
+  if (auto err = parser.Error(); err)
+    return cntx->SendError(err->MakeReply());
 
-  if (timeout < 0) {
+  if (timeout < 0)
     return cntx->SendError("timeout is negative");
-  }
 
   BPopPusher bpop_pusher(src, dest, ListDir::RIGHT, ListDir::LEFT);
   OpResult<string> op_res = bpop_pusher.Run(cntx, unsigned(timeout * 1000));
@@ -783,29 +726,19 @@ void BRPopLPush(CmdArgList args, ConnectionContext* cntx) {
 }
 
 void BLMove(CmdArgList args, ConnectionContext* cntx) {
-  string_view src = ArgS(args, 0);
-  string_view dest = ArgS(args, 1);
-  string_view timeout_str = ArgS(args, 4);
+  facade::CmdArgParser parser{args};
+  auto [src, dest] = parser.Next<string_view, string_view>();
+  ListDir src_dir = ParseDir(&parser);
+  ListDir dest_dir = ParseDir(&parser);
+  float timeout = parser.Next<float>();
 
-  float timeout;
-  if (!absl::SimpleAtof(timeout_str, &timeout)) {
-    return cntx->SendError("timeout is not a float or out of range");
-  }
+  if (auto err = parser.Error(); err)
+    return cntx->SendError(err->MakeReply());
 
-  if (timeout < 0) {
+  if (timeout < 0)
     return cntx->SendError("timeout is negative");
-  }
 
-  ToUpper(&args[2]);
-  ToUpper(&args[3]);
-
-  optional<ListDir> src_dir = ParseDir(ArgS(args, 2));
-  optional<ListDir> dest_dir = ParseDir(ArgS(args, 3));
-  if (!src_dir || !dest_dir) {
-    return cntx->SendError(kSyntaxErr);
-  }
-
-  BPopPusher bpop_pusher(src, dest, *src_dir, *dest_dir);
+  BPopPusher bpop_pusher(src, dest, src_dir, dest_dir);
   OpResult<string> op_res = bpop_pusher.Run(cntx, unsigned(timeout * 1000));
 
   auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
@@ -852,12 +785,11 @@ OpResult<string> BPopPusher::RunSingle(ConnectionContext* cntx, time_point tp) {
         std::array<string_view, 4> arr = {pop_key_, push_key_, DirToSv(popdir_), DirToSv(pushdir_)};
         RecordJournal(op_args, "LMOVE", arr, 1);
       }
-      if (shard->blocking_controller()) {
+      auto blocking_controller = cntx->ns->GetBlockingController(shard->shard_id());
+      if (blocking_controller) {
         string tmp;
 
-        shard->blocking_controller()->AwakeWatched(op_args.db_cntx.db_index, push_key_);
-        absl::StrAppend(debugMessages.Next(), "OpPush AwakeWatched: ", push_key_, " by ",
-                        op_args.tx->DebugId());
+        blocking_controller->AwakeWatched(op_args.db_cntx.db_index, push_key_);
       }
     }
 
@@ -958,34 +890,39 @@ void ListFamily::LLen(CmdArgList args, ConnectionContext* cntx) {
 }
 
 void ListFamily::LPos(CmdArgList args, ConnectionContext* cntx) {
-  string_view key = ArgS(args, 0);
-  string_view elem = ArgS(args, 1);
+  facade::CmdArgParser parser{args};
+  auto [key, elem] = parser.Next<string_view, string_view>();
 
   int rank = 1;
   uint32_t count = 1;
   uint32_t max_len = 0;
   bool skip_count = true;
 
-  for (size_t i = 2; i < args.size(); i++) {
-    ToUpper(&args[i]);
-    const auto& arg_v = ArgS(args, i);
-    if (arg_v == "RANK") {
-      if (!absl::SimpleAtoi(ArgS(args, (i + 1)), &rank) || rank == 0) {
-        return cntx->SendError(kInvalidIntErr);
-      }
+  while (parser.ToUpper().HasNext()) {
+    if (parser.Check("RANK").ExpectTail(1)) {
+      rank = parser.Next<int>();
+      continue;
     }
-    if (arg_v == "COUNT") {
-      if (!absl::SimpleAtoi(ArgS(args, (i + 1)), &count)) {
-        return cntx->SendError(kInvalidIntErr);
-      }
+
+    if (parser.Check("COUNT").ExpectTail(1)) {
+      count = parser.Next<uint32_t>();
       skip_count = false;
+      continue;
     }
-    if (arg_v == "MAXLEN") {
-      if (!absl::SimpleAtoi(ArgS(args, (i + 1)), &max_len)) {
-        return cntx->SendError(kInvalidIntErr);
-      }
+
+    if (parser.Check("MAXLEN").ExpectTail(1)) {
+      max_len = parser.Next<uint32_t>();
+      continue;
     }
+
+    parser.Skip(1);
   }
+
+  if (rank == 0)
+    return cntx->SendError(kInvalidIntErr);
+
+  if (auto err = parser.Error(); err)
+    return cntx->SendError(err->MakeReply());
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpPos(t->GetOpArgs(shard), key, elem, rank, count, max_len);
@@ -1043,20 +980,13 @@ void ListFamily::LIndex(CmdArgList args, ConnectionContext* cntx) {
 
 /* LINSERT <key> (BEFORE|AFTER) <pivot> <element> */
 void ListFamily::LInsert(CmdArgList args, ConnectionContext* cntx) {
-  string_view key = ArgS(args, 0);
-  string_view param = ArgS(args, 1);
-  string_view pivot = ArgS(args, 2);
-  string_view elem = ArgS(args, 3);
-  InsertParam where;
+  facade::CmdArgParser parser{args};
+  string_view key = parser.Next();
+  InsertParam where = parser.ToUpper().Switch("AFTER", INSERT_AFTER, "BEFORE", INSERT_BEFORE);
+  auto [pivot, elem] = parser.Next<string_view, string_view>();
 
-  ToUpper(&args[1]);
-  if (param == "AFTER") {
-    where = INSERT_AFTER;
-  } else if (param == "BEFORE") {
-    where = INSERT_BEFORE;
-  } else {
-    return cntx->SendError(kSyntaxErr);
-  }
+  if (auto err = parser.Error(); err)
+    return cntx->SendError(err->MakeReply());
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpInsert(t->GetOpArgs(shard), key, pivot, elem, where);
@@ -1166,21 +1096,15 @@ void ListFamily::BRPop(CmdArgList args, ConnectionContext* cntx) {
 }
 
 void ListFamily::LMove(CmdArgList args, ConnectionContext* cntx) {
-  std::string_view src = ArgS(args, 0);
-  std::string_view dest = ArgS(args, 1);
-  std::string_view src_dir_str = ArgS(args, 2);
-  std::string_view dest_dir_str = ArgS(args, 3);
+  facade::CmdArgParser parser{args};
+  auto [src, dest] = parser.Next<string_view, string_view>();
+  ListDir src_dir = ParseDir(&parser);
+  ListDir dest_dir = ParseDir(&parser);
 
-  ToUpper(&args[2]);
-  ToUpper(&args[3]);
+  if (auto err = parser.Error(); err)
+    return cntx->SendError(err->MakeReply());
 
-  optional<ListDir> src_dir = ParseDir(src_dir_str);
-  optional<ListDir> dest_dir = ParseDir(dest_dir_str);
-  if (!src_dir || !dest_dir) {
-    return cntx->SendError(kSyntaxErr);
-  }
-
-  MoveGeneric(cntx, src, dest, *src_dir, *dest_dir);
+  MoveGeneric(cntx, src, dest, src_dir, dest_dir);
 }
 
 void ListFamily::BPopGeneric(ListDir dir, CmdArgList args, ConnectionContext* cntx) {
@@ -1222,9 +1146,11 @@ void ListFamily::BPopGeneric(ListDir dir, CmdArgList args, ConnectionContext* cn
     case OpStatus::CANCELLED:
     case OpStatus::TIMED_OUT:
       return rb->SendNullArray();
-    case OpStatus::KEY_MOVED:
-      // TODO: proper error for moved
-      return cntx->SendError("-MOVED");
+    case OpStatus::KEY_MOVED: {
+      auto error = cluster::SlotOwnershipErrorStr(*transaction->GetUniqueSlotId());
+      CHECK(error.has_value());
+      return cntx->SendError(std::move(*error));
+    }
     default:
       LOG(ERROR) << "Unexpected error " << popped_key.status();
   }
@@ -1248,25 +1174,18 @@ void ListFamily::PushGeneric(ListDir dir, bool skip_notexists, CmdArgList args,
 }
 
 void ListFamily::PopGeneric(ListDir dir, CmdArgList args, ConnectionContext* cntx) {
-  string_view key = ArgS(args, 0);
-  int32_t count = 1;
+  facade::CmdArgParser parser{args};
+  string_view key = parser.Next();
+
+  uint32_t count = 1;
   bool return_arr = false;
-
-  if (args.size() > 1) {
-    if (args.size() > 2) {
-      return cntx->SendError(WrongNumArgsError(cntx->cid->name()));
-    }
-
-    string_view count_s = ArgS(args, 1);
-    if (!absl::SimpleAtoi(count_s, &count)) {
-      return cntx->SendError(kInvalidIntErr);
-    }
-
-    if (count < 0) {
-      return cntx->SendError(kUintErr);
-    }
+  if (parser.HasNext()) {
+    count = parser.Next<uint32_t>();
     return_arr = true;
   }
+
+  if (auto err = parser.Error(); err)
+    return cntx->SendError(err->MakeReply());
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpPop(t->GetOpArgs(shard), key, dir, count, true, false);

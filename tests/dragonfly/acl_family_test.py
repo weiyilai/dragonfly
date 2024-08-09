@@ -2,7 +2,7 @@ import pytest
 import redis
 from redis import asyncio as aioredis
 from .instance import DflyInstanceFactory
-from .utility import disconnect_clients
+from .utility import *
 import tempfile
 import asyncio
 import os
@@ -458,6 +458,23 @@ async def test_require_pass(df_factory):
 
 
 @pytest.mark.asyncio
+@dfly_args({"port": 1111, "requirepass": "temp"})
+async def test_require_pass_with_acl_file_order(df_factory, tmp_dir):
+    acl = create_temp_file(
+        "USER default ON >jordan ~* +@all",
+        tmp_dir,
+    )
+
+    df = df_factory.create(aclfile=acl)
+    df.start()
+
+    client = aioredis.Redis(username="default", password="jordan", port=df.port)
+
+    assert await client.set("foo", "bar")
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_set_acl_file(async_client: aioredis.Redis, tmp_dir):
     acl_file_content = "USER roy ON #ea71c25a7a602246b4c39824b855678894a96f43bb9b71319c39700a1e045222 +@string +@fast +hset\nUSER john on nopass +@string"
 
@@ -548,6 +565,43 @@ async def test_acl_keys(async_client):
     # reject because bonus key does not match
     with pytest.raises(redis.exceptions.ResponseError):
         await async_client.execute_command("ZUNIONSTORE destkey 2 barz1 barz2")
+
+
+@pytest.mark.asyncio
+async def test_namespaces(df_factory):
+    df = df_factory.create()
+    df.start()
+
+    admin = aioredis.Redis(port=df.port)
+    assert await admin.execute_command("SET foo admin") == b"OK"
+    assert await admin.execute_command("GET foo") == b"admin"
+
+    # Create ns space named 'ns1'
+    await admin.execute_command("ACL SETUSER adi NAMESPACE:ns1 ON >adi_pass +@all ~*")
+
+    adi = aioredis.Redis(port=df.port)
+    assert await adi.execute_command("AUTH adi adi_pass") == b"OK"
+    assert await adi.execute_command("SET foo bar") == b"OK"
+    assert await adi.execute_command("GET foo") == b"bar"
+    assert await admin.execute_command("GET foo") == b"admin"
+
+    # Adi and Shahar are on the same team
+    await admin.execute_command("ACL SETUSER shahar NAMESPACE:ns1 ON >shahar_pass +@all ~*")
+
+    shahar = aioredis.Redis(port=df.port)
+    assert await shahar.execute_command("AUTH shahar shahar_pass") == b"OK"
+    assert await shahar.execute_command("GET foo") == b"bar"
+    assert await shahar.execute_command("SET foo bar2") == b"OK"
+    assert await adi.execute_command("GET foo") == b"bar2"
+
+    # Roman is a CTO, he has his own private space
+    await admin.execute_command("ACL SETUSER roman NAMESPACE:ns2 ON >roman_pass +@all ~*")
+
+    roman = aioredis.Redis(port=df.port)
+    assert await roman.execute_command("AUTH roman roman_pass") == b"OK"
+    assert await roman.execute_command("GET foo") == None
+
+    await close_clients(admin, adi, shahar, roman)
 
 
 @pytest.mark.asyncio
